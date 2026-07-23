@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Нателла ❤️</title>
+<style>
+  html,body{
+    margin:0; padding:0; width:100%; height:100%;
+    background:#000; overflow:hidden;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas{
+    display:block; width:100%; height:100%;
+  }
+  #vignette{
+    position:fixed; inset:0; pointer-events:none;
+    background:radial-gradient(ellipse at center, rgba(0,0,0,0) 40%, rgba(0,0,0,0.55) 100%);
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="vignette"></div>
+<script>
+(function(){
+"use strict";
+
+/* ---------------------------------------------------------
+   SETUP
+--------------------------------------------------------- */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d', { alpha:false });
+
+let DPR = Math.min(window.devicePixelRatio || 1, 1.6);
+let W, H, CX, CY;
+
+let resizeTimer = null;
+function resize(){
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width = W * DPR;
+  canvas.height = H * DPR;
+  canvas.style.width = W+'px';
+  canvas.style.height = H+'px';
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  CX = W/2; CY = H/2;
+
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(()=>{
+    // full rebuild so proportions stay correct after an orientation/size change
+    startTime = null;
+    nameTriggered = false;
+    heartTriggered = false;
+    shootingStars = [];
+    flares = [];
+    initParticles();
+    buildTargets();
+  }, 250);
+}
+
+/* ---------------------------------------------------------
+   SPRITES (pre-rendered glow dots, drawn via drawImage
+   instead of arc()+shadowBlur for performance)
+--------------------------------------------------------- */
+function makeSprite(core, mid){
+  const s = 64;
+  const c = document.createElement('canvas');
+  c.width = c.height = s;
+  const cx = c.getContext('2d');
+  const g = cx.createRadialGradient(s/2,s/2,0, s/2,s/2,s/2);
+  g.addColorStop(0, core);
+  g.addColorStop(0.35, mid);
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  cx.fillStyle = g;
+  cx.beginPath();
+  cx.arc(s/2,s/2,s/2,0,Math.PI*2);
+  cx.fill();
+  return c;
+}
+
+const SPRITES = {
+  white: makeSprite('rgba(255,255,255,1)',  'rgba(255,255,255,0.55)'),
+  gold:  makeSprite('rgba(250,238,222,0.92)', 'rgba(214,178,150,0.32)'),
+  amber: makeSprite('rgba(240,220,196,0.85)', 'rgba(190,150,120,0.28)'),
+  pink:  makeSprite('rgba(255,170,190,1)',  'rgba(255,35,95,0.55)'),
+  red:   makeSprite('rgba(255,120,140,1)',  'rgba(220,10,55,0.55)'),
+  blue:  makeSprite('rgba(205,220,255,1)',  'rgba(140,165,255,0.4)')
+};
+
+/* ---------------------------------------------------------
+   TEXT (name) POINT SAMPLING
+--------------------------------------------------------- */
+function sampleTextPoints(text, count, targetWidth){
+  // measure at a reference size, then scale to hit targetWidth exactly
+  const refSize = 200;
+  const measureCanvas = document.createElement('canvas');
+  const mctx = measureCanvas.getContext('2d');
+  mctx.font = `italic 700 ${refSize}px Georgia, "Times New Roman", serif`;
+  const refWidth = mctx.measureText(text).width;
+  let fontSize = (targetWidth / refWidth) * refSize;
+  fontSize = Math.max(40, Math.min(260, fontSize));
+
+  const offW = Math.max(W, fontSize*text.length*0.8);
+  const offH = fontSize * 1.9;
+
+  const off = document.createElement('canvas');
+  off.width = offW; off.height = offH;
+  const octx = off.getContext('2d');
+  octx.clearRect(0,0,offW,offH);
+  octx.fillStyle = '#fff';
+  octx.textAlign = 'center';
+  octx.textBaseline = 'middle';
+  octx.font = `italic 700 ${fontSize}px Georgia, "Times New Roman", serif`;
+  octx.fillText(text, offW/2, offH/2);
+
+  const data = octx.getImageData(0,0,offW,offH).data;
+  const pts = [];
+  const step = 2;
+  let minX=Infinity, maxX=-Infinity, minY=Infinity, maxY=-Infinity;
+  for(let y=0; y<offH; y+=step){
+    for(let x=0; x<offW; x+=step){
+      const a = data[(y*offW+x)*4+3];
+      if(a > 120){
+        const px = x - offW/2, py = y - offH/2;
+        pts.push({x: px, y: py});
+        if(px<minX)minX=px; if(px>maxX)maxX=px;
+        if(py<minY)minY=py; if(py>maxY)maxY=py;
+      }
+    }
+  }
+  // shuffle & trim/pad to desired count
+  for(let i=pts.length-1;i>0;i--){
+    const j = (Math.random()*(i+1))|0;
+    const t = pts[i]; pts[i]=pts[j]; pts[j]=t;
+  }
+  const out = [];
+  for(let i=0;i<count;i++){
+    const p = pts[i % pts.length];
+    // tiny jitter so duplicates don't perfectly overlap
+    out.push({
+      x: CX + p.x + (Math.random()-0.5)*1.2,
+      y: CY + p.y + (Math.random()-0.5)*1.2
+    });
+  }
+  return { points: out, textW: maxX-minX, textH: maxY-minY, fontSize };
+}
+
+/* ---------------------------------------------------------
+   HEART OUTLINE POINT SAMPLING (parametric heart)
+   The heart's own on-screen size is computed first, bounded
+   safely by the real viewport, and the name is sized as a
+   fraction of it — so nothing ever clips and the name is
+   always clearly legible inside the heart.
+--------------------------------------------------------- */
+function heartUnitPoint(t){
+  const x = 16*Math.pow(Math.sin(t),3);
+  const y = -(13*Math.cos(t) - 5*Math.cos(2*t) - 2*Math.cos(3*t) - Math.cos(4*t));
+  return { x, y };
+}
+
+let heartUnitBounds = null;
+function getHeartUnitBounds(){
+  if(heartUnitBounds) return heartUnitBounds;
+  let minX=Infinity,maxX=-Infinity,minY=Infinity,maxY=-Infinity;
+  const N=1200;
+  for(let i=0;i<N;i++){
+    const p = heartUnitPoint((i/N)*Math.PI*2);
+    if(p.x<minX)minX=p.x; if(p.x>maxX)maxX=p.x;
+    if(p.y<minY)minY=p.y; if(p.y>maxY)maxY=p.y;
+  }
+  heartUnitBounds = {
+    cx:(minX+maxX)/2, cy:(minY+maxY)/2,
+    w:(maxX-minX), h:(maxY-minY)
+  };
+  return heartUnitBounds;
+}
+
+// Safe heart width in pixels, bounded by BOTH viewport axes with margin.
+function computeSafeHeartWidth(){
+  const unit = getHeartUnitBounds();
+  const aspect = unit.h / unit.w; // heart height / width
+  const marginX = Math.max(28, W*0.07);
+  const marginY = Math.max(40, H*0.10);
+  const maxByWidth  = W - marginX*2;
+  const maxByHeight = (H - marginY*2) / aspect;
+  let w = Math.min(maxByWidth, maxByHeight);
+  w = Math.max(w, Math.min(W,H)*0.32); // sensible floor
+  return w;
+}
+
+function sampleHeartPoints(count, desiredW){
+  const unit = getHeartUnitBounds();
+  const s = desiredW / unit.w;
+
+  const layers = [0.90, 0.96, 1.02, 1.08, 1.15];
+  const raw = [];
+  const N = 900;
+  for(let li=0; li<layers.length; li++){
+    const lf = layers[li];
+    for(let i=0;i<N;i++){
+      const p = heartUnitPoint((i/N)*Math.PI*2);
+      // scale outward from the heart's own center -> even ring thickness
+      const dx = (p.x - unit.cx) * lf;
+      const dy = (p.y - unit.cy) * lf;
+      raw.push({ x: dx*s, y: dy*s });
+    }
+  }
+  for(let i=raw.length-1;i>0;i--){
+    const j=(Math.random()*(i+1))|0;
+    const t=raw[i]; raw[i]=raw[j]; raw[j]=t;
+  }
+  const out = [];
+  for(let i=0;i<count;i++){
+    const p = raw[i % raw.length];
+    out.push({
+      x: CX + p.x + (Math.random()-0.5)*3,
+      y: CY + p.y + (Math.random()-0.5)*3
+    });
+  }
+  return out;
+}
+
+/* ---------------------------------------------------------
+   PARTICLE POOL
+--------------------------------------------------------- */
+const TOTAL = (W && W < 700) ? 3000 : 4200; // provisional, refined after first resize
+let particles = [];
+
+const NAME_TEXT = "Нателла";
+
+function easeInOutCubic(t){
+  return t<0.5 ? 4*t*t*t : 1-Math.pow(-2*t+2,3)/2;
+}
+function easeOutCubic(t){ return 1-Math.pow(1-t,3); }
+function lerp(a,b,t){ return a+(b-a)*t; }
+
+function rand(a,b){ return a+Math.random()*(b-a); }
+
+function makeAmbientHome(){
+  // wide field with depth (z influences size/speed -> parallax feel)
+  const z = Math.random();
+  const margin = 60;
+  return {
+    x: rand(-margin, W+margin),
+    y: rand(-margin, H+margin),
+    z: z
+  };
+}
+
+function initParticles(){
+  const isSmall = W < 700;
+  const total = isSmall ? 2600 : 4200;
+  const nameCount = Math.round(total*0.34);
+  const heartCount = Math.round(total*0.29);
+  const ambientCount = total - nameCount - heartCount;
+
+  particles = [];
+
+  for(let i=0;i<ambientCount;i++){
+    const home = makeAmbientHome();
+    particles.push({
+      role: 'ambient',
+      x: home.x, y: home.y, z: home.z,
+      homeX: home.x, homeY: home.y,
+      size: lerp(0.6, 2.4, home.z),
+      colorKey: Math.random()<0.12 ? 'blue' : 'white',
+      alphaBase: lerp(0.25,0.95, home.z),
+      twinkleSpeed: rand(0.6,2.2),
+      twinklePhase: rand(0,Math.PI*2),
+      driftAngle: rand(0,Math.PI*2),
+      driftSpeed: lerp(1,6, home.z)
+    });
+  }
+
+  for(let i=0;i<nameCount;i++){
+    const home = makeAmbientHome();
+    particles.push({
+      role: 'toName',
+      x: home.x, y: home.y,
+      fromX: home.x, fromY: home.y,
+      targetX: CX, targetY: CY, // filled by buildTargets
+      settledX: CX, settledY: CY,
+      moving:false, moveStart:0, moveDur: rand(3.4,5.4),
+      startDelay: rand(0,1.8),
+      spiralAmp: rand(40,140),
+      spiralTurns: rand(1.2,2.6),
+      spiralDir: Math.random()<0.5?1:-1,
+      spiralSeed: rand(0,Math.PI*2),
+      size: rand(1.6,3.2),
+      colorKey: Math.random()<0.55 ? 'gold':'amber',
+      alphaBase: rand(0.55,0.8),
+      twinkleSpeed: rand(0.8,1.8),
+      twinklePhase: rand(0,Math.PI*2),
+      depthOff: rand(2,7) * (Math.random()<0.5?1:-1),
+      arrived:false
+    });
+  }
+
+  for(let i=0;i<heartCount;i++){
+    const home = makeAmbientHome();
+    particles.push({
+      role: 'ambientToHeart', // stays ambient until heart phase triggers
+      x: home.x, y: home.y, z: home.z,
+      homeX: home.x, homeY: home.y,
+      size: lerp(0.7,2.2, home.z),
+      colorKey: 'white',
+      alphaBase: lerp(0.25,0.9, home.z),
+      twinkleSpeed: rand(0.6,2.0),
+      twinklePhase: rand(0,Math.PI*2),
+      driftAngle: rand(0,Math.PI*2),
+      driftSpeed: lerp(1,5, home.z),
+
+      // orbit / heart-convergence fields (used later)
+      orbiting:false,
+      orbitAngle: rand(0,Math.PI*2),
+      orbitSpeed: rand(0.35,0.9) * (Math.random()<0.5?1:-1),
+      orbitRStart: 0,
+      orbitRTarget: 0,
+      orbitStart: 0,
+      orbitDur: rand(2.2,3.6),
+      orbitDelay: rand(0,2.4),
+
+      converging:false,
+      fromX:0, fromY:0,
+      targetX:0, targetY:0,
+      moveStart:0, moveDur: rand(1.8,2.8),
+      spiralAmp: rand(20,70),
+      spiralSeed: rand(0,Math.PI*2),
+      spiralDir: Math.random()<0.5?1:-1,
+      colorHeart: Math.random()<0.6 ? 'pink':'red',
+      alphaHeart: rand(0.8,1)
+    });
+  }
+}
+
+let nameTargets = [];
+let heartTargets = [];
+let nameBox = { w:600, h:200 };
+
+function buildTargets(){
+  const heartW = computeSafeHeartWidth();
+  const nameTargetWidth = heartW * 0.52;
+
+  const nameRes = sampleTextPoints(NAME_TEXT, countByRole('toName'), nameTargetWidth);
+  nameTargets = nameRes.points;
+  nameBox = { w: nameRes.textW, h: nameRes.textH };
+  heartTargets = sampleHeartPoints(countByRole('ambientToHeart'), heartW);
+
+  let ni=0, hi=0;
+  for(const p of particles){
+    if(p.role==='toName' || p.role==='name'){
+      const t = nameTargets[ni % nameTargets.length]; ni++;
+      p.targetX = t.x; p.targetY = t.y;
+      p.settledX = t.x; p.settledY = t.y;
+    } else if(p.role==='ambientToHeart' || p.role==='orbitHeart' || p.role==='heart'){
+      const t = heartTargets[hi % heartTargets.length]; hi++;
+      p.heartX = t.x; p.heartY = t.y;
+    }
+  }
+}
+
+function countByRole(role){
+  let c=0;
+  for(const p of particles) if(p.role===role) c++;
+  return c;
+}
+
+/* ---------------------------------------------------------
+   TIMELINE / PHASES
+--------------------------------------------------------- */
+const T_FADE_IN      = 2.4;
+const T_CONVERGE_START= 4.0;
+const T_ORBIT_START  = 12.5;
+const T_ZOOM_START   = 4.0;
+
+let startTime = null;
+let heartTriggered = false;
+let nameTriggered = false;
+
+/* ---------------------------------------------------------
+   EPHEMERAL FX: shooting stars & flares
+--------------------------------------------------------- */
+let shootingStars = [];
+let flares = [];
+let lastShootTime = 0;
+let lastFlareTime = 0;
+
+function spawnShootingStar(now){
+  const edge = Math.random()<0.5;
+  const x0 = edge ? rand(0,W) : (Math.random()<0.5?-40:W+40);
+  const y0 = edge ? -40 : rand(0,H*0.6);
+  const angle = rand(Math.PI*0.15, Math.PI*0.35);
+  const speed = rand(700,1100);
+  shootingStars.push({
+    x:x0, y:y0,
+    vx: Math.cos(angle)*speed, vy: Math.sin(angle)*speed,
+    life:0, maxLife: rand(0.7,1.1),
+    size: rand(1.5,2.6)
+  });
+}
+
+function spawnFlare(now){
+  flares.push({
+    x: rand(W*0.2,W*0.8),
+    y: rand(H*0.15,H*0.75),
+    life:0, maxLife: rand(1.2,2.0),
+    size: rand(60,160),
+    color: Math.random()<0.5?'gold':'white'
+  });
+}
+
+/* ---------------------------------------------------------
+   MAIN UPDATE
+--------------------------------------------------------- */
+function update(now, dt, elapsed){
+
+  // trigger name convergence
+  if(!nameTriggered && elapsed >= T_CONVERGE_START){
+    nameTriggered = true;
+    for(const p of particles){
+      if(p.role==='toName'){
+        p.fromX = p.x; p.fromY = p.y;
+      }
+    }
+  }
+
+  // trigger heart / orbit phase
+  if(!heartTriggered && elapsed >= T_ORBIT_START){
+    heartTriggered = true;
+    for(const p of particles){
+      if(p.role==='ambientToHeart'){
+        p.role = 'orbitHeart';
+        const dx = p.x-CX, dy = p.y-CY;
+        p.orbitAngle = Math.atan2(dy,dx);
+        p.orbitRStart = Math.hypot(dx,dy);
+        p.orbitRTarget = Math.hypot(p.heartX-CX,p.heartY-CY)*0.55;
+        p.orbitStart = elapsed + p.orbitDelay;
+      }
+    }
+  }
+
+  for(const p of particles){
+    if(p.role==='ambient'){
+      p.driftAngle += dt*0.04;
+      p.x = ((p.homeX + Math.cos(p.driftAngle)*p.driftSpeed*8) % (W+120) + (W+120)) % (W+120) - 60;
+      p.y += Math.sin(elapsed*0.03+p.twinklePhase)*0.05;
+      continue;
+    }
+
+    if(p.role==='toName'){
+      const localElapsed = elapsed - T_CONVERGE_START - p.startDelay;
+      if(!nameTriggered || localElapsed < 0){
+        // gentle idle drift pre-trigger
+        p.x += Math.sin(elapsed*0.5+p.twinklePhase)*0.05;
+        p.y += Math.cos(elapsed*0.5+p.twinklePhase)*0.05;
+        continue;
+      }
+      const t = Math.min(1, localElapsed / p.moveDur);
+      const e = easeInOutCubic(t);
+      const bx = lerp(p.fromX, p.targetX, e);
+      const by = lerp(p.fromY, p.targetY, e);
+      const dx = p.targetX-p.fromX, dy = p.targetY-p.fromY;
+      const len = Math.hypot(dx,dy) || 1;
+      const px = -dy/len, py = dx/len;
+      const decay = (1-e);
+      const ang = p.spiralSeed + t*p.spiralTurns*Math.PI*2*p.spiralDir;
+      const off = Math.sin(ang)*p.spiralAmp*decay;
+      p.x = bx + px*off;
+      p.y = by + py*off;
+      if(t>=1){ p.role='name'; p.arrived=true; p.x=p.targetX; p.y=p.targetY; }
+      continue;
+    }
+
+    if(p.role==='name'){
+      // gentle settled flicker jitter
+      p.x = p.targetX + Math.sin(elapsed*0.6+p.twinklePhase)*0.6;
+      p.y = p.targetY + Math.cos(elapsed*0.5+p.twinklePhase)*0.6;
+      continue;
+    }
+
+    if(p.role==='orbitHeart'){
+      if(elapsed < p.orbitStart){
+        continue;
+      }
+      const localT = elapsed - p.orbitStart;
+      if(localT < p.orbitDur){
+        const t = localT/p.orbitDur;
+        const e = easeOutCubic(t);
+        const r = lerp(p.orbitRStart, p.orbitRTarget, e);
+        p.orbitAngle += p.orbitSpeed*dt*(1.6-e*0.9);
+        p.x = CX + Math.cos(p.orbitAngle)*r;
+        p.y = CY + Math.sin(p.orbitAngle)*r*0.94;
+      } else {
+        p.role = 'convergeHeart';
+        p.fromX = p.x; p.fromY = p.y;
+        p.moveStart = elapsed;
+      }
+      continue;
+    }
+
+    if(p.role==='convergeHeart'){
+      const t = Math.min(1, (elapsed - p.moveStart)/p.moveDur);
+      const e = easeInOutCubic(t);
+      const bx = lerp(p.fromX, p.heartX, e);
+      const by = lerp(p.fromY, p.heartY, e);
+      const dx = p.heartX-p.fromX, dy = p.heartY-p.fromY;
+      const len = Math.hypot(dx,dy) || 1;
+      const px=-dy/len, py=dx/len;
+      const decay=(1-e);
+      const ang = p.spiralSeed + t*Math.PI*3*p.spiralDir;
+      const off = Math.sin(ang)*p.spiralAmp*decay;
+      p.x = bx+px*off; p.y = by+py*off;
+      if(t>=1){ p.role='heart'; p.x=p.heartX; p.y=p.heartY; }
+      continue;
+    }
+
+    if(p.role==='heart'){
+      const pulse = 1 + Math.sin(elapsed*0.8)*0.012;
+      p.x = CX + (p.heartX-CX)*pulse + Math.sin(elapsed*0.7+p.twinklePhase)*0.5;
+      p.y = CY + (p.heartY-CY)*pulse + Math.cos(elapsed*0.6+p.twinklePhase)*0.5;
+      continue;
+    }
+  }
+
+  // shooting stars (only once scene has matured a bit)
+  if(elapsed > 6){
+    if(now - lastShootTime > rand(1800,3800)){
+      lastShootTime = now;
+      spawnShootingStar(now);
+    }
+  }
+  shootingStars = shootingStars.filter(s=>{
+    s.life += dt;
+    s.x += s.vx*dt; s.y += s.vy*dt;
+    return s.life < s.maxLife && s.x < W+80 && s.y < H+80;
+  });
+
+  if(elapsed > T_ORBIT_START+2){
+    if(now - lastFlareTime > rand(2200,4200)){
+      lastFlareTime = now;
+      spawnFlare(now);
+    }
+  }
+  flares = flares.filter(f=>{ f.life+=dt; return f.life < f.maxLife; });
+}
+
+/* ---------------------------------------------------------
+   RENDER
+--------------------------------------------------------- */
+function render(elapsed){
+  // trailing fade
+  ctx.globalCompositeOperation = 'source-over';
+  const introFade = Math.min(1, elapsed / T_FADE_IN);
+  ctx.fillStyle = `rgba(0,0,0,${elapsed < T_FADE_IN ? (0.35+0.4*(1-introFade)) : 0.22})`;
+  ctx.fillRect(0,0,W,H);
+
+  // camera zoom / rotation
+  const zoomT = Math.min(1, Math.max(0,(elapsed - T_ZOOM_START))/40);
+  const zoom = 1 + zoomT*0.22;
+  const rotation = Math.sin(elapsed*0.045)*0.025;
+
+  ctx.save();
+  ctx.translate(CX,CY);
+  ctx.rotate(rotation);
+  ctx.scale(zoom,zoom);
+  ctx.translate(-CX,-CY);
+
+  ctx.globalCompositeOperation = 'lighter';
+
+  for(const p of particles){
+    let x=p.x, y=p.y, size=p.size, alpha, sprite;
+
+    if(p.role==='ambient' || p.role==='ambientToHeart'){
+      const tw = 0.55 + 0.45*Math.sin(elapsed*p.twinkleSpeed + p.twinklePhase);
+      alpha = p.alphaBase * tw * introFade;
+      sprite = SPRITES[p.colorKey];
+      size = p.size;
+    } else if(p.role==='toName'){
+      const tw = 0.7 + 0.3*Math.sin(elapsed*p.twinkleSpeed+p.twinklePhase);
+      alpha = p.alphaBase*tw;
+      sprite = SPRITES[p.colorKey];
+      size = p.size*1.3;
+    } else if(p.role==='name'){
+      const tw = 0.7 + 0.14*Math.sin(elapsed*p.twinkleSpeed+p.twinklePhase);
+      alpha = p.alphaBase*tw*0.72;
+      sprite = SPRITES[p.colorKey];
+      size = p.size*1.15;
+      // volumetric depth extrusion (draw dim copy offset behind)
+      const dAlpha = alpha*0.2;
+      ctx.globalAlpha = dAlpha;
+      ctx.drawImage(SPRITES.amber, x-size/2+p.depthOff, y-size/2+p.depthOff, size, size);
+    } else if(p.role==='orbitHeart' || p.role==='convergeHeart'){
+      const tw = 0.7+0.3*Math.sin(elapsed*4+p.spiralSeed);
+      alpha = 0.85*tw;
+      sprite = SPRITES.white;
+      size = p.size ? p.size*1.4 : 2.4;
+    } else if(p.role==='heart'){
+      const tw = 0.75 + 0.25*Math.sin(elapsed*1.4+p.twinklePhase);
+      alpha = p.alphaHeart*tw;
+      sprite = SPRITES[p.colorHeart];
+      size = 2.6*tw;
+    }
+
+    ctx.globalAlpha = Math.max(0,Math.min(1,alpha));
+    ctx.drawImage(sprite, x-size/2, y-size/2, size, size);
+  }
+
+  // shooting stars
+  ctx.globalAlpha = 1;
+  for(const s of shootingStars){
+    const a = 1 - s.life/s.maxLife;
+    const tailX = s.x - s.vx*0.05;
+    const tailY = s.y - s.vy*0.05;
+    const grad = ctx.createLinearGradient(s.x,s.y,tailX,tailY);
+    grad.addColorStop(0, `rgba(255,255,255,${a})`);
+    grad.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.strokeStyle = grad;
+    ctx.lineWidth = s.size;
+    ctx.beginPath();
+    ctx.moveTo(s.x,s.y);
+    ctx.lineTo(tailX,tailY);
+    ctx.stroke();
+    ctx.globalAlpha = a;
+    ctx.drawImage(SPRITES.white, s.x-s.size, s.y-s.size, s.size*2, s.size*2);
+  }
+
+  // flares
+  for(const f of flares){
+    const t = f.life/f.maxLife;
+    const a = Math.sin(t*Math.PI) * 0.5;
+    const sp = SPRITES[f.color];
+    const sz = f.size * (0.6+t*0.6);
+    ctx.globalAlpha = a;
+    ctx.drawImage(sp, f.x-sz/2, f.y-sz/2, sz, sz);
+  }
+
+  ctx.restore();
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+}
+
+/* ---------------------------------------------------------
+   LOOP
+--------------------------------------------------------- */
+let lastNow = null;
+function frame(now){
+  if(startTime===null) startTime = now;
+  if(lastNow===null) lastNow = now;
+  const dt = Math.min(0.05,(now-lastNow)/1000);
+  lastNow = now;
+  const elapsed = (now-startTime)/1000;
+
+  update(now, dt, elapsed);
+  render(elapsed);
+
+  requestAnimationFrame(frame);
+}
+
+/* ---------------------------------------------------------
+   INIT
+--------------------------------------------------------- */
+function init(){
+  W = window.innerWidth; H = window.innerHeight;
+  CX = W/2; CY = H/2;
+  canvas.width = W*DPR; canvas.height = H*DPR;
+  canvas.style.width=W+'px'; canvas.style.height=H+'px';
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0,0,W,H);
+
+  initParticles();
+  buildTargets();
+
+  window.addEventListener('resize', ()=>{
+    resize();
+  });
+
+  requestAnimationFrame(frame);
+}
+
+init();
+
+})();
+</script>
+</body>
+</html>
